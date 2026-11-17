@@ -19,6 +19,7 @@ from cas_login import LoginError, login_genai
 from genai_proxy.models import (
     MODEL_SPECS,
     build_remote_model_list,
+    register_remote_models,
     resolve_model,
     is_gpt_model,
 )
@@ -37,8 +38,8 @@ from genai_proxy.images import (
     parse_image_input_from_message,
 )
 from genai_proxy.tools import (
-    convert_messages_to_genai_format,
     normalize_messages_for_genai,
+    split_messages_for_genai,
     should_enable_tools,
     get_request_tools,
     get_request_tool_choice,
@@ -101,6 +102,19 @@ def save_cached_token(token):
         logger.exception("Failed to write token cache")
 
 
+GENAI_MODELS_URL = "https://genai.shanghaitech.edu.cn/htk/ai/aiModel/list"
+# GenAI 平台属于校内服务，终端若配置了代理（如 127.0.0.1:6865）会导致 TLS/连接失败，默认直连。
+GENAI_PROXIES = (
+    None
+    if os.environ.get("GENAI_USE_ENV_PROXY", "").strip().lower() in {"1", "true", "yes"}
+    else {"http": None, "https": None, "all": None, "no_proxy": "shanghaitech.edu.cn"}
+)
+
+
+def _genai_proxy_kwargs():
+    return {"proxies": GENAI_PROXIES} if GENAI_PROXIES is not None else {}
+
+
 def build_startup_genai_headers(token):
     """构建启动阶段校验 token 所需的最小上游请求头。"""
     return {
@@ -116,56 +130,30 @@ def build_startup_genai_headers(token):
 
 
 def validate_cached_token(token):
-    """用 deepseek-v3 发起最小对话，返回非空内容则认为 token 有效。"""
+    """通过拉取上游模型列表校验缓存 token 是否有效（不依赖具体模型名）。"""
     if not token:
         return False
 
-    payload = {
-        "chatInfo": "你好",
-        "messages": [{"role": "user", "content": "你好"}],
-        "type": "3",
-        "stream": True,
-        "aiType": "deepseek-v3:671b",
-        "aiSecType": "1",
-        "promptTokens": 0,
-        "rootAiType": "xinference",
-        "maxToken": 16,
-    }
-
     try:
-        response = requests.post(
-            "https://genai.shanghaitech.edu.cn/htk/chat/start/chat",
+        response = requests.get(
+            GENAI_MODELS_URL,
             headers=build_startup_genai_headers(token),
-            json=payload,
-            stream=True,
+            params={
+                "_t": int(datetime.now().timestamp() * 1000),
+                "pageNo": 1,
+                "pageSize": 10,
+                "showStatusList": "2,3",
+            },
             timeout=30,
+            **_genai_proxy_kwargs(),
         )
         if response.status_code != 200:
             logger.info("Cached token validation failed with HTTP %s", response.status_code)
             return False
 
-        for line in response.iter_lines():
-            if not line:
-                continue
-
-            line_str = line.decode("utf-8") if isinstance(line, bytes) else line
-            if line_str.startswith("data:"):
-                line_str = line_str[5:].strip()
-            if not line_str:
-                continue
-
-            try:
-                chunk = json.loads(line_str)
-            except json.JSONDecodeError:
-                continue
-
-            choices = chunk.get("choices") or []
-            if not choices:
-                continue
-
-            delta = choices[0].get("delta") or {}
-            if delta.get("content") or delta.get("reasoning"):
-                return True
+        payload = response.json()
+        if payload.get("success") and isinstance((payload.get("result") or {}).get("records"), list):
+            return True
     except Exception:
         logger.exception("Cached token validation failed")
 
@@ -206,7 +194,6 @@ IMAGE_UPLOAD_CACHE = {}
 
 # GenAI API 配置
 GENAI_URL = "https://genai.shanghaitech.edu.cn/htk/chat/start/chat"
-GENAI_MODELS_URL = "https://genai.shanghaitech.edu.cn/htk/ai/aiModel/list"
 GENAI_UPLOAD_URL = "https://genaipic.shanghaitech.edu.cn//sys/common/upload"
 GENAI_IMAGE_STATIC_URL = "https://genaipic.shanghaitech.edu.cn//sys/common/static/"
 GENAI_STREAM_TIMEOUT = (10, 180)
@@ -268,6 +255,7 @@ def fetch_remote_models(access_token=None):
             "showStatusList": "2,3",
         },
         timeout=30,
+        **_genai_proxy_kwargs(),
     )
     response.raise_for_status()
     payload = response.json()
@@ -276,6 +264,7 @@ def fetch_remote_models(access_token=None):
     records = (payload.get("result") or {}).get("records")
     if not isinstance(records, list):
         raise RuntimeError("Invalid remote model list: missing records array")
+    register_remote_models(records)
     return records
 
 
@@ -366,6 +355,7 @@ def upload_image_to_genai(image_bytes, filename, mime_type, access_token=None):
         files=files,
         data=data,
         timeout=60,
+        **_genai_proxy_kwargs(),
     )
     response.raise_for_status()
     payload = response.json()
@@ -435,11 +425,12 @@ def _stream_genai_attempt(messages, model, max_tokens, access_token=None, image_
         dict: 统一事件对象，`type` 可能为 `delta`、`done`、`meta` 或 `error`。
     """
     upstream_model, root_ai_type = resolve_model(model)
+    payload_messages, chat_info = split_messages_for_genai(messages)
 
     # 这里保持与网页端接近的请求体结构，避免上游校验差异。
     genai_data = {
-        "chatInfo": "",
-        "messages": messages,
+        "chatInfo": chat_info,
+        "messages": payload_messages,
         "type": "3",
         "stream": True,
         "aiType": upstream_model,
@@ -458,7 +449,7 @@ def _stream_genai_attempt(messages, model, max_tokens, access_token=None, image_
         genai_data.get("stream"),
         genai_data.get("maxToken"),
         bool(image_payload),
-        len(messages) if isinstance(messages, list) else 0,
+        len(payload_messages),
     )
 
     response = None
@@ -488,7 +479,8 @@ def _stream_genai_attempt(messages, model, max_tokens, access_token=None, image_
             headers=build_genai_headers(access_token),
             json=genai_data,
             stream=True,
-            timeout=GENAI_STREAM_TIMEOUT
+            timeout=GENAI_STREAM_TIMEOUT,
+            **_genai_proxy_kwargs(),
         )
 
         if response.status_code != 200:
@@ -584,25 +576,52 @@ def stream_chat_completions_response(messages, model, max_tokens, access_token=N
     """
     response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(datetime.now().timestamp())
+    sent_role = False
+    events = iter_with_heartbeat(
+        stream_genai_events(messages, model, max_tokens, access_token, image_payload)
+    )
 
-    for event in stream_genai_events(messages, model, max_tokens, access_token, image_payload):
-        if event["type"] == "delta" and event.get("tool_calls"):
-            event = {"type": "error", "error": "Upstream returned native tool calls without enabled tools"}
-        if event["type"] == "error":
-            yield f"data: {json.dumps({'error': event['error']})}\n\n"
-            yield "data: [DONE]\n\n"
-            return
+    try:
+        for event in events:
+            if event is None:
+                yield ": keep-alive\n\n"
+                continue
+            if event["type"] == "delta" and event.get("tool_calls"):
+                event = {"type": "error", "error": "Upstream returned native tool calls without enabled tools"}
+            if event["type"] == "error":
+                yield f"data: {json.dumps({'error': event['error']})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
 
-        if event["type"] == "delta":
-            delta_payload = {}
-            # 对外沿用 DeepSeek 常见字段名 reasoning_content。
-            if event.get("reasoning") is not None:
-                delta_payload["reasoning_content"] = event["reasoning"]
-            if event.get("content") is not None:
-                delta_payload["content"] = event["content"]
+            if event["type"] == "delta":
+                delta_payload = {}
+                # 对外沿用 DeepSeek 常见字段名 reasoning_content。
+                if event.get("reasoning") is not None:
+                    delta_payload["reasoning_content"] = event["reasoning"]
+                if event.get("content") is not None:
+                    delta_payload["content"] = event["content"]
 
-            if delta_payload:
-                openai_response = {
+                if delta_payload:
+                    if not sent_role:
+                        delta_payload = {"role": "assistant", **delta_payload}
+                        sent_role = True
+                    openai_response = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": delta_payload,
+                                "finish_reason": None
+                            }
+                        ]
+                    }
+                    yield f"data: {json.dumps(openai_response)}\n\n"
+
+            if event["type"] == "done":
+                final_response = {
                     "id": response_id,
                     "object": "chat.completion.chunk",
                     "created": created,
@@ -610,33 +629,23 @@ def stream_chat_completions_response(messages, model, max_tokens, access_token=N
                     "choices": [
                         {
                             "index": 0,
-                            "delta": delta_payload,
-                            "finish_reason": None
+                            "delta": {},
+                            "finish_reason": event.get("finish_reason", "stop")
                         }
                     ]
                 }
-                yield f"data: {json.dumps(openai_response)}\n\n"
-
-        if event["type"] == "done":
-            final_response = {
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": event.get("finish_reason", "stop")
-                    }
-                ]
-            }
-            yield f"data: {json.dumps(final_response)}\n\n"
-            yield "data: [DONE]\n\n"
-            return
+                yield f"data: {json.dumps(final_response)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+    except Exception as exc:
+        logger.warning("Chat stream failed: model=%s error=%s", model, exc)
+        yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+        yield "data: [DONE]\n\n"
+    finally:
+        events.close()
 
 
-def stream_tool_calls_response(model, content, tool_calls, finish_reason="stop"):
+def stream_tool_calls_response(model, content, tool_calls, finish_reason="stop", reasoning_content=None):
     """将完整解析出的工具调用转换为 Chat Completions SSE。"""
     response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(datetime.now().timestamp())
@@ -660,6 +669,8 @@ def stream_tool_calls_response(model, content, tool_calls, finish_reason="stop")
                 {
                     "index": 0,
                     "delta": {
+                        "role": "assistant",
+                        "content": None,
                         "tool_calls": delta_tool_calls,
                     },
                     "finish_reason": None,
@@ -669,6 +680,9 @@ def stream_tool_calls_response(model, content, tool_calls, finish_reason="stop")
         yield f"data: {json.dumps(tool_call_chunk)}\n\n"
         finish_reason = "tool_calls"
     else:
+        delta_payload = {"role": "assistant", "content": content}
+        if reasoning_content:
+            delta_payload["reasoning_content"] = reasoning_content
         content_chunk = {
             "id": response_id,
             "object": "chat.completion.chunk",
@@ -677,9 +691,7 @@ def stream_tool_calls_response(model, content, tool_calls, finish_reason="stop")
             "choices": [
                 {
                     "index": 0,
-                    "delta": {
-                        "content": content,
-                    },
+                    "delta": delta_payload,
                     "finish_reason": None,
                 }
             ]
@@ -707,6 +719,7 @@ def stream_buffered_tool_response(messages, model, max_tokens, access_token=None
     """聚合工具 JSON 时发送心跳，避免客户端在静默等待时断开。"""
     started_at = time.monotonic()
     content_parts = []
+    reasoning_parts = []
     native_calls = ToolCallAccumulator()
     finish_reason = None
     events = iter_with_heartbeat(
@@ -719,6 +732,8 @@ def stream_buffered_tool_response(messages, model, max_tokens, access_token=None
             elif event["type"] == "error":
                 raise RuntimeError(event["error"])
             elif event["type"] == "delta":
+                if event.get("reasoning"):
+                    reasoning_parts.append(event["reasoning"])
                 if event.get("content"):
                     content_parts.append(event["content"])
                 native_calls.add(event.get("tool_calls"))
@@ -740,7 +755,9 @@ def stream_buffered_tool_response(messages, model, max_tokens, access_token=None
             "Tool response collected: model=%s elapsed=%.1fs content_chars=%s tool_call_count=%s",
             model, time.monotonic() - started_at, len(content), len(tool_calls),
         )
-        yield from stream_tool_calls_response(model, content, tool_calls)
+        yield from stream_tool_calls_response(
+            model, content, tool_calls, reasoning_content="".join(reasoning_parts) or None,
+        )
     except Exception as exc:
         logger.warning(
             "Tool stream failed: model=%s content_chars=%s finish_reason=%s error=%s",
@@ -825,64 +842,87 @@ def stream_responses_api(messages, model, max_tokens, access_token=None):
     }
     yield f"data: {json.dumps(created_event)}\n\n"
 
-    for event in stream_genai_events(messages, model, max_tokens, access_token):
-        if event["type"] == "delta" and event.get("tool_calls"):
-            event = {"type": "error", "error": "Native tool calls require Chat Completions with enabled tools"}
-        if event["type"] == "error":
-            error_event = {
-                "type": "response.failed",
-                "response": {
-                    "id": response_id,
-                    "object": "response",
-                    "created_at": created,
-                    "status": "failed",
-                    "model": model,
-                },
-                "error": {
-                    "message": event["error"],
+    events = iter_with_heartbeat(
+        stream_genai_events(messages, model, max_tokens, access_token)
+    )
+    try:
+        for event in events:
+            if event is None:
+                yield ": keep-alive\n\n"
+                continue
+            if event["type"] == "delta" and event.get("tool_calls"):
+                event = {"type": "error", "error": "Native tool calls require Chat Completions with enabled tools"}
+            if event["type"] == "error":
+                error_event = {
+                    "type": "response.failed",
+                    "response": {
+                        "id": response_id,
+                        "object": "response",
+                        "created_at": created,
+                        "status": "failed",
+                        "model": model,
+                    },
+                    "error": {
+                        "message": event["error"],
+                    }
                 }
-            }
-            yield f"data: {json.dumps(error_event)}\n\n"
-            yield "data: [DONE]\n\n"
-            return
+                yield f"data: {json.dumps(error_event)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
 
-        if event["type"] == "delta":
-            # Responses 接口将 reasoning 和正文拆成不同事件类型。
-            if event.get("reasoning") is not None:
-                reasoning_event = {
-                    "type": "response.reasoning.delta",
-                    "response_id": response_id,
-                    "output_index": output_index,
-                    "item_id": reasoning_id,
-                    "delta": event["reasoning"],
-                }
-                yield f"data: {json.dumps(reasoning_event)}\n\n"
+            if event["type"] == "delta":
+                # Responses 接口将 reasoning 和正文拆成不同事件类型。
+                if event.get("reasoning") is not None:
+                    reasoning_event = {
+                        "type": "response.reasoning.delta",
+                        "response_id": response_id,
+                        "output_index": output_index,
+                        "item_id": reasoning_id,
+                        "delta": event["reasoning"],
+                    }
+                    yield f"data: {json.dumps(reasoning_event)}\n\n"
 
-            if event.get("content") is not None:
-                content_event = {
-                    "type": "response.output_text.delta",
-                    "response_id": response_id,
-                    "output_index": output_index,
-                    "delta": event["content"],
-                }
-                yield f"data: {json.dumps(content_event)}\n\n"
+                if event.get("content") is not None:
+                    content_event = {
+                        "type": "response.output_text.delta",
+                        "response_id": response_id,
+                        "output_index": output_index,
+                        "delta": event["content"],
+                    }
+                    yield f"data: {json.dumps(content_event)}\n\n"
 
-        if event["type"] == "done":
-            incomplete = event.get("finish_reason", "stop") != "stop"
-            completed_event = {
-                "type": "response.incomplete" if incomplete else "response.completed",
-                "response": {
-                    "id": response_id,
-                    "object": "response",
-                    "created_at": created,
-                    "status": "incomplete" if incomplete else "completed",
-                    "model": model,
-                    "incomplete_details": {"reason": event["finish_reason"]} if incomplete else None,
+            if event["type"] == "done":
+                incomplete = event.get("finish_reason", "stop") != "stop"
+                completed_event = {
+                    "type": "response.incomplete" if incomplete else "response.completed",
+                    "response": {
+                        "id": response_id,
+                        "object": "response",
+                        "created_at": created,
+                        "status": "incomplete" if incomplete else "completed",
+                        "model": model,
+                        "incomplete_details": {"reason": event["finish_reason"]} if incomplete else None,
+                    }
                 }
-            }
-            yield f"data: {json.dumps(completed_event)}\n\n"
-            yield "data: [DONE]\n\n"
-            return
+                yield f"data: {json.dumps(completed_event)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+    except Exception as exc:
+        error_event = {
+            "type": "response.failed",
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "created_at": created,
+                "status": "failed",
+                "model": model,
+            },
+            "error": {"message": str(exc)},
+        }
+        yield f"data: {json.dumps(error_event)}\n\n"
+        yield "data: [DONE]\n\n"
+    finally:
+        events.close()
 
 @app.route('/v1/chat/completions', methods=['POST'])
 def chat_completions():
@@ -892,32 +932,39 @@ def chat_completions():
         Response: Flask JSON 响应或 SSE 流式响应。
     """
     try:
-        req_data = request.get_json()
+        req_data = request.get_json(force=True, silent=True)
         logger.debug("/v1/chat/completions request received: stream=%s model=%s", (req_data or {}).get('stream'), (req_data or {}).get('model'))
         
         # Chat Completions 至少需要消息数组。
-        if not req_data or 'messages' not in req_data:
+        if not req_data or not isinstance(req_data.get('messages'), list):
             return jsonify({'error': 'Missing messages field'}), 400
         
         messages = req_data.get('messages', [])
-        model = req_data.get('model', 'gpt-3.5-turbo')
+        model = req_data.get('model') or 'deepseek-pro'
         stream = req_data.get('stream', False)
-        max_tokens = req_data.get('max_tokens', req_data.get('max_completion_tokens', 30000))
+        max_tokens = req_data.get('max_tokens')
+        if max_tokens is None:
+            max_tokens = req_data.get('max_completion_tokens')
+        if max_tokens is None:
+            max_tokens = 30000
         tools = get_request_tools(req_data)
         tool_choice = get_request_tool_choice(req_data)
+        parallel_tool_calls = req_data.get('parallel_tool_calls', True)
         access_token = get_request_access_token()
         image_payload = prepare_image_payload(messages, model, access_token)
-        
-        # 转换消息格式
-        chat_info = convert_messages_to_genai_format(messages)
-        
-        if not chat_info:
-            return jsonify({'error': 'No user message found'}), 400
 
         tools_enabled = should_enable_tools(tools, tool_choice)
-        upstream_messages = normalize_messages_for_genai(messages)
+        upstream_messages = normalize_messages_for_genai(
+            messages,
+            default_image_text="请查看图片" if image_payload else "",
+        )
+        if not upstream_messages:
+            return jsonify({'error': 'No valid message found'}), 400
+
         if tools_enabled:
-            upstream_messages = build_tool_calling_messages(upstream_messages, tools, tool_choice)
+            upstream_messages = build_tool_calling_messages(
+                upstream_messages, tools, tool_choice, parallel_tool_calls=parallel_tool_calls,
+            )
 
         if stream:
             if tools_enabled:
@@ -945,6 +992,7 @@ def chat_completions():
                     'Cache-Control': 'no-cache',
                     'Connection': 'keep-alive',
                     'Content-Type': 'text/event-stream',
+                    'X-Accel-Buffering': 'no',
                 }
             )
 
@@ -980,15 +1028,23 @@ def responses():
         Response: Flask JSON 响应或 SSE 流式响应。
     """
     try:
-        req_data = request.get_json()
+        req_data = request.get_json(force=True, silent=True)
         logger.debug("/v1/responses request received: stream=%s model=%s", (req_data or {}).get('stream'), (req_data or {}).get('model'))
         if not req_data or 'input' not in req_data:
             return jsonify({'error': 'Missing input field'}), 400
 
-        model = req_data.get('model', 'gpt-4.1')
+        model = req_data.get('model') or 'deepseek-pro'
         stream = req_data.get('stream', False)
-        max_output_tokens = req_data.get('max_output_tokens', req_data.get('max_tokens', 30000))
+        max_output_tokens = req_data.get('max_output_tokens')
+        if max_output_tokens is None:
+            max_output_tokens = req_data.get('max_tokens')
+        if max_output_tokens is None:
+            max_output_tokens = 30000
         messages = build_response_input_messages(req_data.get('input'))
+        instructions = req_data.get('instructions')
+        if isinstance(instructions, str) and instructions.strip():
+            messages = [{"role": "system", "content": instructions}, *messages]
+        messages = normalize_messages_for_genai(messages)
         access_token = get_request_access_token()
 
         if not messages:
@@ -1002,6 +1058,7 @@ def responses():
                     'Cache-Control': 'no-cache',
                     'Connection': 'keep-alive',
                     'Content-Type': 'text/event-stream',
+                    'X-Accel-Buffering': 'no',
                 }
             )
 

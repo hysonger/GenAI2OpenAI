@@ -3,7 +3,7 @@ import sys
 import unittest
 from unittest.mock import Mock, patch
 
-from genai_proxy.models import build_remote_model_list
+from genai_proxy.models import REMOTE_MODEL_LOOKUP, build_remote_model_list, register_remote_models, resolve_model
 
 
 class RemoteModelTests(unittest.TestCase):
@@ -65,6 +65,18 @@ class RemoteModelTests(unittest.TestCase):
                 self.assertEqual(result.status_code, 502)
                 self.assertIn('error', result.json)
                 self.assertNotIn('data', result.json)
+
+    def test_remote_models_register_canonical_id_and_root_ai_type(self):
+        self.addCleanup(REMOTE_MODEL_LOOKUP.clear)
+        register_remote_models([
+            {'aiType': 'GPT-6.1-Sol', 'rootAiType': 'azure'},
+            {'aiType': 'Kimi-k3', 'rootAiType': 'xinference'},
+            {'aiType': 'custom-azure-model', 'rootAiType': 'azure'},
+        ])
+        self.assertEqual(resolve_model('gpt-6.1-sol'), ('GPT-6.1-Sol', 'azure'))
+        self.assertEqual(resolve_model('kimi-k3'), ('Kimi-k3', 'xinference'))
+        self.assertEqual(resolve_model('custom-azure-model'), ('custom-azure-model', 'azure'))
+        self.assertEqual(resolve_model('o5-mini'), ('o5-mini', 'azure'))
 
 
 if __name__ == '__main__':

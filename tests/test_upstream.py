@@ -1,7 +1,12 @@
 import unittest
 import json
 
-from genai_proxy.tools import build_tool_calling_messages, parse_tool_calls_from_content
+from genai_proxy.tools import (
+    build_tool_calling_messages,
+    normalize_messages_for_genai,
+    parse_tool_calls_from_content,
+    split_messages_for_genai,
+)
 from genai_proxy.upstream import iter_sse_events
 
 
@@ -26,11 +31,36 @@ class UpstreamSseTests(unittest.TestCase):
 
         result = build_tool_calling_messages(messages, tools, "auto")
 
-        self.assertEqual(result[:-1], messages)
         self.assertEqual(len(messages), 2)
-        self.assertEqual(result[-1]["role"], "system")
-        self.assertIn('"tool_calls"', result[-1]["content"])
-        self.assertIn('"name": "glob"', result[-1]["content"])
+        self.assertEqual(messages[0]["content"], "Use native tools to inspect files.")
+        self.assertEqual(messages[1]["content"], "Inspect this project.")
+        self.assertEqual(result[0]["role"], "system")
+        self.assertTrue(all(msg["role"] != "system" for msg in result[1:]))
+        self.assertIn("Use native tools to inspect files.", result[0]["content"])
+        self.assertIn('"tool_calls"', result[0]["content"])
+        self.assertIn('"name": "glob"', result[0]["content"])
+        self.assertNotIn("<tool_call>", result[0]["content"])
+        self.assertEqual(result[-1]["role"], "user")
+        self.assertIn("Inspect this project.", result[-1]["content"])
+        self.assertIn("工具协议提醒", result[-1]["content"])
+
+    def test_tool_prompt_and_chat_info_split_with_trailing_assistant(self):
+        messages = normalize_messages_for_genai([
+            {"role": "developer", "content": "Follow rules."},
+            {"role": "user", "content": "Check repo."},
+            {"role": "assistant", "content": "Checking."},
+        ])
+        tools = [{"type": "function", "function": {"name": "glob"}}]
+
+        prepared = build_tool_calling_messages(messages, tools, "required", parallel_tool_calls=False)
+        payload_msgs, chat_info = split_messages_for_genai(prepared)
+
+        self.assertEqual(prepared[0]["role"], "system")
+        self.assertIn("每轮最多调用一个工具", prepared[0]["content"])
+        self.assertEqual(prepared[-1]["role"], "user")
+        self.assertIn("必须调用至少一个工具", prepared[-1]["content"])
+        self.assertEqual(chat_info, prepared[-1]["content"])
+        self.assertTrue(all(m["role"] != "system" for m in payload_msgs[1:]))
 
     def test_last_delta_is_kept_when_finish_reason_is_present(self):
         fragments = ['{"tool_calls":[', '{"name":"weather","arguments":{}}]}']

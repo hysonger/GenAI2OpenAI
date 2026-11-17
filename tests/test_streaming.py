@@ -3,7 +3,7 @@ import json
 import sys
 import unittest
 from threading import Event
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from genai_proxy.streaming import iter_with_heartbeat
 
@@ -173,3 +173,52 @@ class ToolStreamTests(unittest.TestCase):
             finally:
                 ready.set()
                 response.close()
+
+    def test_upstream_payload_sets_nonempty_chat_info_and_max_completion_tokens(self):
+        fake = Mock(status_code=200)
+        fake.iter_lines.return_value = iter([
+            b'data: {"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}',
+        ])
+        with patch.object(self.server.requests, "post", return_value=fake) as upstream:
+            response = self.server.app.test_client().post("/v1/chat/completions", json={
+                "model": "Kimi-k3",
+                "stream": False,
+                "max_tokens": None,
+                "max_completion_tokens": 1234,
+                "messages": [
+                    {"role": "developer", "content": "Always answer concisely."},
+                    {"role": "user", "content": "hi"},
+                ],
+            })
+        self.assertEqual(response.status_code, 200)
+        sent_json = upstream.call_args.kwargs["json"]
+        self.assertEqual(sent_json["maxToken"], 1234)
+        self.assertEqual(sent_json["chatInfo"], "hi")
+        self.assertEqual(sent_json["messages"], [{"role": "system", "content": "Always answer concisely."}])
+        if self.server.GENAI_PROXIES is not None:
+            self.assertEqual(upstream.call_args.kwargs["proxies"], self.server.GENAI_PROXIES)
+
+    def test_responses_instructions_and_validate_cached_token(self):
+        with patch.object(self.server, "stream_genai_events") as stream_mock:
+            stream_mock.return_value = iter([{"type": "delta", "content": "OK"}, {"type": "done"}])
+            resp = self.server.app.test_client().post("/v1/responses", json={
+                "model": "qwen-instruct",
+                "instructions": "Be brief.",
+                "input": [{"role": "developer", "content": "Use plain text."}, {"role": "user", "content": "say OK"}],
+                "max_output_tokens": None,
+                "max_tokens": 321,
+            })
+        self.assertEqual(resp.status_code, 200)
+        passed_msgs = stream_mock.call_args.args[0]
+        self.assertEqual(passed_msgs[0]["role"], "system")
+        self.assertIn("Be brief.", passed_msgs[0]["content"])
+        self.assertIn("Use plain text.", passed_msgs[0]["content"])
+        self.assertEqual(stream_mock.call_args.args[2], 321)
+
+        ok_resp = Mock(status_code=200)
+        ok_resp.json.return_value = {"success": True, "result": {"records": []}}
+        bad_resp = Mock(status_code=200)
+        bad_resp.json.return_value = {"success": False, "message": "Token失效"}
+        with patch.object(self.server.requests, "get", side_effect=[ok_resp, bad_resp]):
+            self.assertTrue(self.server.validate_cached_token("valid"))
+            self.assertFalse(self.server.validate_cached_token("expired"))

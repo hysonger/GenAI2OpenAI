@@ -1,7 +1,11 @@
 import json
 import unittest
 
-from genai_proxy.tools import normalize_messages_for_genai, parse_tool_calls_from_content
+from genai_proxy.tools import (
+    normalize_messages_for_genai,
+    parse_tool_calls_from_content,
+    split_messages_for_genai,
+)
 
 
 class ToolParsingTests(unittest.TestCase):
@@ -86,3 +90,55 @@ class ToolParsingTests(unittest.TestCase):
         result = normalize_messages_for_genai([{"role": "assistant", "content": "读取文件。", "tool_calls": [self.call]}])
         self.assertIn('读取文件。', result[0]['content'])
         self.assertIn('read_file', result[0]['content'])
+
+    def test_normalize_handles_developer_mid_system_tool_names_and_images(self):
+        messages = [
+            {"role": "developer", "content": "Dev rules"},
+            {"role": "system", "content": "Base rules"},
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}]},
+            {"role": "assistant", "content": None, "tool_calls": [self.call]},
+            {"role": "system", "content": "Mid reminder"},
+            {"role": "tool", "tool_call_id": "call_example_0", "content": "file data"},
+        ]
+        normalized = normalize_messages_for_genai(messages, default_image_text="请查看图片")
+        self.assertEqual(normalized[0]["role"], "system")
+        self.assertIn("Dev rules", normalized[0]["content"])
+        self.assertIn("Base rules", normalized[0]["content"])
+        self.assertTrue(all(m["role"] != "system" for m in normalized[1:]))
+        self.assertEqual(normalized[1], {"role": "user", "content": "请查看图片"})
+        self.assertIn("read_file (call_example_0)", normalized[-1]["content"])
+
+        payload_msgs, chat_info = split_messages_for_genai(normalized)
+        self.assertEqual(len(payload_msgs), len(normalized) - 1)
+        self.assertIn("file data", chat_info)
+
+    def test_json_with_xml_inside_args_prose_json_and_null_args(self):
+        tools = [
+            {"type": "function", "function": {"name": "read_file"}},
+            {"type": "function", "function": {"name": "write_file"}},
+            {"type": "function", "function": {"name": "git_status"}},
+        ]
+        # 参数内部包含 <tool_call> 字样不应误触发 XML 分支报错
+        json_with_xml = json.dumps({
+            "tool_calls": [{"name": "write_file", "arguments": {"content": "check '<tool_call>' tag"}}],
+        })
+        parsed_xml_arg = parse_tool_calls_from_content(json_with_xml, tools)
+        self.assertEqual(parsed_xml_arg[0]["function"]["name"], "write_file")
+
+        # 前导正文中的普通 JSON 不应掩盖后面的真实 tool_calls
+        prose_then_calls = (
+            '前置配置：{"ok": true}\n'
+            '<think>思考过程</think>\n'
+            '{"tool_calls": [{"name": "git_status", "arguments": null}]}'
+        )
+        parsed_prose = parse_tool_calls_from_content(prose_then_calls, tools)
+        self.assertEqual(parsed_prose[0]["function"]["name"], "git_status")
+        self.assertEqual(parsed_prose[0]["function"]["arguments"], "{}")
+
+        # 多个连续裸 JSON 对象调用均应保留
+        two_bare = (
+            '{"name": "read_file", "arguments": {"path": "a.py"}}\n'
+            '{"name": "git_status", "arguments": {}}'
+        )
+        parsed_two = parse_tool_calls_from_content(two_bare, tools)
+        self.assertEqual([c["function"]["name"] for c in parsed_two], ["read_file", "git_status"])

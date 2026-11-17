@@ -19,13 +19,15 @@ def convert_messages_to_genai_format(messages):
         str: 最后一条用户消息的文本内容；若不存在则返回空字符串。
     """
     # 上游会单独接收一份 chatInfo，这里取最后一条 user 消息与网页行为对齐。
-    chat_info = ""
     for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
         if msg.get("role") == "user":
-            chat_info = msg.get("content", "")
-            break
+            text = normalize_content_for_genai(msg.get("content", ""))
+            if text:
+                return text
 
-    return chat_info
+    return ""
 
 
 def normalize_content_for_genai(content):
@@ -39,6 +41,8 @@ def normalize_content_for_genai(content):
         for part in content:
             if isinstance(part, dict):
                 text = part.get("text")
+                if isinstance(text, dict):
+                    text = text.get("value")
                 if text:
                     text_parts.append(text)
             elif isinstance(part, str):
@@ -47,9 +51,73 @@ def normalize_content_for_genai(content):
     return str(content)
 
 
-def normalize_messages_for_genai(messages):
-    """把 OpenAI tool messages 降级为普通文本，避免上游无法理解原生工具结构。"""
+def _message_has_image_part(message):
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(part, dict) and part.get("type") in {"image_url", "input_image"}
+        for part in content
+    )
+
+
+def _collect_tool_call_names(messages):
+    """收集历史 assistant 消息中的 tool_call_id -> 函数名映射。"""
+    names = {}
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            call_id = call.get("id")
+            fn_name = (call.get("function") or {}).get("name") if isinstance(call.get("function"), dict) else call.get("name")
+            if isinstance(call_id, str) and call_id and isinstance(fn_name, str) and fn_name:
+                names[call_id] = fn_name
+    return names
+
+
+def _ensure_leading_system_only(messages):
+    """合并开头 system 消息，并将中间 system 消息转为 user 提示。
+
+    部分上游模型（如 Qwen）严格要求 system 消息只能位于消息列表最前端。
+    """
+    leading_system_parts = []
+    rest = []
+    seen_non_system = False
+
+    for message in messages:
+        role = message.get("role", "user")
+        content = message.get("content", "")
+        if role == "system" and not seen_non_system:
+            if content:
+                leading_system_parts.append(content)
+            continue
+
+        seen_non_system = True
+        if role == "system":
+            if content:
+                rest.append({"role": "user", "content": f"[系统提示]\n{content}"})
+            continue
+        rest.append(dict(message))
+
+    result = []
+    if leading_system_parts:
+        result.append({"role": "system", "content": "\n\n".join(leading_system_parts)})
+    result.extend(rest)
+    return result
+
+
+def normalize_messages_for_genai(messages, default_image_text=""):
+    """归一化 OpenAI 消息为上游兼容格式。
+
+    - 将 `developer` 统一映射为 `system`，避免部分模型报 422 或忽略指令；
+    - 将 `tool`/`function` 消息降级为普通 `user` 文本；
+    - 合并开头 `system` 并将非开头 `system` 转为 `user` 提示，满足首条 `system` 约束。
+    """
+    call_names = _collect_tool_call_names(messages)
     normalized_messages = []
+
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -57,20 +125,40 @@ def normalize_messages_for_genai(messages):
         role = message.get("role", "user")
         content = normalize_content_for_genai(message.get("content"))
 
-        if role == "tool":
-            tool_name = message.get("name") or message.get("tool_call_id") or "tool"
+        if role == "developer":
+            role = "system"
+
+        if role in ("tool", "function"):
+            tool_call_id = message.get("tool_call_id")
+            explicit_name = message.get("name")
+            resolved_name = call_names.get(tool_call_id) if tool_call_id else None
+            if explicit_name and tool_call_id:
+                tool_label = f"{explicit_name} ({tool_call_id})"
+            else:
+                tool_label = explicit_name or (f"{resolved_name} ({tool_call_id})" if resolved_name else tool_call_id) or "tool"
             normalized_messages.append({
                 "role": "user",
-                "content": f"工具 {tool_name} 返回结果：\n{content}",
+                "content": f"工具 {tool_label} 返回结果：\n{content}",
             })
             continue
 
         tool_calls = message.get("tool_calls")
-        if role == "assistant" and tool_calls:
+        function_call = message.get("function_call")
+        if role == "assistant" and (tool_calls or function_call):
+            serialized = json.dumps(tool_calls if tool_calls else [function_call], ensure_ascii=False)
             normalized_messages.append({
                 "role": "assistant",
-                "content": (content + "\n" if content else "") + "已请求调用工具：\n" + json.dumps(tool_calls, ensure_ascii=False),
+                "content": (content + "\n" if content else "") + "已请求调用工具：\n" + serialized,
             })
+            continue
+
+        if role == "user" and not content:
+            if _message_has_image_part(message) and default_image_text:
+                content = default_image_text
+            else:
+                continue
+
+        if role in ("system", "assistant") and not content:
             continue
 
         normalized_messages.append({
@@ -78,7 +166,21 @@ def normalize_messages_for_genai(messages):
             "content": content,
         })
 
-    return normalized_messages
+    return _ensure_leading_system_only(normalized_messages)
+
+
+def split_messages_for_genai(messages):
+    """拆分发送给 GenAI 上游的 `messages` 与 `chatInfo`。
+
+    GenAI 后端会自动把 `chatInfo` 作为最后一条 `user` 消息追加到 `messages` 末尾。
+    若保留 `chatInfo=""`，上游会在末尾注入空 user 消息导致 Kimi-k3 等模型直接报错。
+    """
+    copied = [dict(msg) for msg in messages if isinstance(msg, dict)]
+    if copied and copied[-1].get("role") == "user":
+        last_content = copied[-1].get("content") or ""
+        if isinstance(last_content, str) and last_content.strip():
+            return copied[:-1], last_content
+    return copied, "请继续。"
 
 
 def should_enable_tools(tools, tool_choice):
@@ -132,30 +234,55 @@ def normalize_tool_choice(tool_choice):
     return "auto"
 
 
-def build_tool_calling_messages(messages, tools, tool_choice):
+def build_tool_calling_messages(messages, tools, tool_choice, parallel_tool_calls=True):
     """通过提示词工程让无原生工具调用能力的上游返回可解析的工具调用 JSON。"""
     normalized_choice = normalize_tool_choice(tool_choice)
     tool_prompt = [
         "你可以调用调用方提供的工具，但上游 API 没有原生 tool calling 能力。",
-        "当你决定调用工具时，优先输出一个 JSON 对象，不要输出 Markdown、解释或额外文本。",
+        "当你决定调用工具时，只输出一个合法的 JSON 对象，不要输出 Markdown 代码块、XML 标签、解释或额外文本。",
         "JSON 格式必须为：{\"tool_calls\":[{\"name\":\"工具名\",\"arguments\":{}}]}。",
-        "兼容格式：也允许输出 <tool_call>{\"name\":\"工具名\",\"arguments\":{}}</tool_call>；若并行调用可连续输出多个 <tool_call>...</tool_call>。",
-        "arguments 必须是符合工具 JSON Schema 的对象。",
+        "arguments 必须是符合工具 JSON Schema 的对象；若工具无参数，arguments 设为 {}。",
+    ]
+    if parallel_tool_calls is False:
+        tool_prompt.append("每轮最多调用一个工具。")
+    tool_prompt.extend([
         "如果不需要调用工具，则正常回答用户，不要输出上述 JSON。",
-        "如果需要通过工具查看文件或执行操作，本轮必须输出工具调用，不能只描述接下来要做什么。",
+        "如果需要通过工具查看文件或执行操作，本轮必须直接输出工具调用 JSON，不能只描述接下来要做什么。",
         f"tool_choice: {json.dumps(normalized_choice, ensure_ascii=False)}",
         "可用工具：",
         json.dumps(tools, ensure_ascii=False),
-    ]
+    ])
 
     if normalized_choice == "required":
         tool_prompt.append("本次请求必须调用至少一个工具。")
+        reminder = "[工具协议提醒：本轮必须调用至少一个工具，请直接输出 {\"tool_calls\":[{\"name\":\"...\",\"arguments\":{}}]} JSON，不要输出普通正文、Markdown 或 XML 标签。]"
     elif isinstance(normalized_choice, dict):
         tool_prompt.append(f"本次请求必须调用工具 {normalized_choice['name']}。")
+        reminder = (
+            f"[工具协议提醒：本轮必须调用工具 {normalized_choice['name']}，"
+            f"请直接输出 {{\"tool_calls\":[{{\"name\":\"{normalized_choice['name']}\",\"arguments\":{{}}}}]}} JSON，不要输出普通正文、Markdown 或 XML 标签。]"
+        )
+    else:
+        reminder = "[工具协议提醒：若需调用工具，请直接输出 {\"tool_calls\":[{\"name\":\"...\",\"arguments\":{}}]} JSON，不要只输出行动预告、Markdown 或 XML 标签；若无需调用工具，请直接给出最终回答。]"
 
-    # 客户端可能已有很长的 system prompt；将上游输出格式约定放在完整
-    # 上下文之后，避免模型只输出行动预告就结束本轮，而不输出工具 JSON。
-    return [*messages, {"role": "system", "content": "\n".join(tool_prompt)}]
+    prepared = _ensure_leading_system_only([dict(m) for m in messages if isinstance(m, dict)])
+    tool_prompt_text = "\n".join(tool_prompt)
+
+    # 将完整工具定义放入首条 system，避免尾部 system 导致 Qwen 等模型报 400/500。
+    if prepared and prepared[0].get("role") == "system":
+        existing = prepared[0].get("content") or ""
+        prepared[0]["content"] = f"{existing}\n\n{tool_prompt_text}" if existing else tool_prompt_text
+    else:
+        prepared.insert(0, {"role": "system", "content": tool_prompt_text})
+
+    # 同时在末尾 user 轮附带精简强提示，防止长上下文下模型只输出行动预告而不调用工具。
+    if prepared and prepared[-1].get("role") == "user":
+        last_content = prepared[-1].get("content") or ""
+        prepared[-1]["content"] = f"{last_content}\n\n{reminder}" if last_content else reminder
+    else:
+        prepared.append({"role": "user", "content": reminder})
+
+    return prepared
 
 
 def strip_json_code_fence(text):
@@ -170,6 +297,12 @@ def strip_json_code_fence(text):
     return stripped
 
 
+def _strip_leading_think_block(text):
+    """若文本以闭合的 <think>...</think> 开头且后续仍有内容，剥离思考块以便提取工具 JSON。"""
+    match = re.match(r"^\s*<think>.*?</think>\s*(.+)$", text, flags=re.DOTALL)
+    return match.group(1) if match else text
+
+
 def is_tool_call_object(value):
     """普通 JSON 的 name 字段不代表工具调用。"""
     if not isinstance(value, dict):
@@ -179,6 +312,14 @@ def is_tool_call_object(value):
         isinstance(function, dict) and "name" in function
         or "name" in value and "arguments" in value
     )
+
+
+def _is_tool_payload(value):
+    if isinstance(value, dict):
+        return "tool_calls" in value or is_tool_call_object(value)
+    if isinstance(value, list):
+        return any(is_tool_call_object(item) for item in value)
+    return False
 
 
 def looks_like_tool_container(text):
@@ -231,25 +372,46 @@ def repair_tool_wrapper(text):
 
 
 def extract_json_object(text):
-    """从文本中提取完整容器；仅修复完整工具调用的外层闭合。"""
-    stripped = strip_json_code_fence(text)
+    """从文本中提取工具调用容器或完整 JSON；优先识别工具协议对象。"""
+    stripped = strip_json_code_fence(_strip_leading_think_block(text))
     try:
         return json.loads(stripped)
     except json.JSONDecodeError:
         pass
+
     decoder = json.JSONDecoder()
-    for match in re.finditer(r"[\[{]", stripped):
-        candidate = stripped[match.start():]
+    pos = 0
+    first_non_tool_value = None
+    collected_bare_calls = []
+
+    while pos < len(stripped):
+        match = re.search(r"[\[{]", stripped[pos:])
+        if not match:
+            break
+        start = pos + match.start()
+        candidate = stripped[start:]
         try:
-            value, _ = decoder.raw_decode(stripped, match.start())
-            return value
+            value, end_offset = decoder.raw_decode(stripped, start)
+            if _is_tool_payload(value):
+                if isinstance(value, dict) and "tool_calls" not in value and is_tool_call_object(value):
+                    collected_bare_calls.append(value)
+                    pos = end_offset
+                    continue
+                return value
+            if first_non_tool_value is None:
+                first_non_tool_value = value
+            pos = end_offset
         except json.JSONDecodeError:
             if looks_like_tool_container(candidate):
                 repaired = repair_tool_wrapper(candidate)
                 if repaired is not None:
                     return repaired
                 raise ValueError("Invalid or incomplete tool call JSON")
-    return None
+            pos = start + 1
+
+    if collected_bare_calls:
+        return collected_bare_calls if len(collected_bare_calls) > 1 else collected_bare_calls[0]
+    return first_non_tool_value
 
 
 def normalize_tool_call_arguments(arguments):
@@ -261,14 +423,31 @@ def normalize_tool_call_arguments(arguments):
     return json.dumps(arguments, ensure_ascii=False)
 
 
+def _try_parse_whole_json_payload(content):
+    """仅当整段输出可直接解析为工具 JSON 时优先走 JSON 通道，避免参数内含 <tool_call> 字样误触发 XML 分支。"""
+    stripped = strip_json_code_fence(_strip_leading_think_block(content))
+    if not stripped.startswith(("{", "[")):
+        return None
+    try:
+        parsed = json.loads(stripped)
+        if _is_tool_payload(parsed):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    return None
+
+
 def parse_tool_calls_from_content(content, tools=None, tool_choice=None):
     """解析工具对象、数组和 XML；只返回已声明且参数为 JSON 对象的调用。"""
     if not content:
         return []
 
-    if "<tool_call>" in content:
-        blocks = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", content, flags=re.DOTALL)
-        if len(blocks) != content.count("<tool_call>"):
+    content_for_parse = _strip_leading_think_block(content)
+    whole_json = _try_parse_whole_json_payload(content_for_parse)
+
+    if whole_json is None and "<tool_call>" in content_for_parse:
+        blocks = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", content_for_parse, flags=re.DOTALL)
+        if len(blocks) != content_for_parse.count("<tool_call>"):
             raise ValueError("Incomplete tool_call block")
         raw_calls = []
         for block in blocks:
@@ -277,7 +456,7 @@ def parse_tool_calls_from_content(content, tools=None, tool_choice=None):
                 raise ValueError("Invalid tool_call JSON")
             raw_calls.append(parsed)
     else:
-        parsed = extract_json_object(content)
+        parsed = whole_json if whole_json is not None else extract_json_object(content_for_parse)
         if isinstance(parsed, list):
             # 普通答案也可能是 JSON 数组，只有调用形状才当作工具协议。
             if not any(is_tool_call_object(item) for item in parsed):
@@ -309,6 +488,8 @@ def parse_tool_calls_from_content(content, tools=None, tool_choice=None):
         if allowed_names is not None and name not in allowed_names:
             raise ValueError(f"Unknown tool: {name}")
         arguments = function.get("arguments", {})
+        if arguments is None:
+            arguments = {}
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments)

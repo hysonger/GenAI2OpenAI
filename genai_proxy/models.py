@@ -1,5 +1,8 @@
 """Model registry and alias resolution."""
 
+import re
+from threading import Lock
+
 
 MODEL_SPECS = [
     {
@@ -112,6 +115,30 @@ def build_model_alias_lookup():
 
 
 MODEL_ALIAS_LOOKUP = build_model_alias_lookup()
+_REMOTE_MODEL_LOCK = Lock()
+REMOTE_MODEL_LOOKUP = {}
+
+
+def register_remote_models(records):
+    """缓存从上游实时拉取的模型路由信息，便于解析动态新增模型。"""
+    lookup = {}
+    for record in records or []:
+        if not isinstance(record, dict):
+            continue
+        ai_type = record.get("aiType")
+        if not isinstance(ai_type, str) or not ai_type.strip():
+            continue
+        canonical_id = ai_type.strip()
+        root_ai_type = record.get("rootAiType")
+        if not isinstance(root_ai_type, str) or not root_ai_type.strip():
+            root_ai_type = infer_root_ai_type(canonical_id)
+        else:
+            root_ai_type = root_ai_type.strip()
+        lookup[canonical_id.lower()] = (canonical_id, root_ai_type)
+
+    with _REMOTE_MODEL_LOCK:
+        REMOTE_MODEL_LOOKUP.clear()
+        REMOTE_MODEL_LOOKUP.update(lookup)
 
 
 def build_remote_model_list(records):
@@ -138,8 +165,8 @@ def resolve_model(model_name):
     """解析模型名称到上游请求参数。
 
     Args:
-        model_name (Any): 调用方传入的模型名，可能是 public id、request id
-            或 actual id。
+        model_name (Any): 调用方传入的模型名，可能是远端 `aiType`、public id、
+            request id 或 actual id。
 
     Returns:
         tuple[Any, str]: 第一个元素为实际发给上游的 `aiType`，第二个元素为
@@ -148,10 +175,16 @@ def resolve_model(model_name):
     if not isinstance(model_name, str):
         return model_name, infer_root_ai_type(model_name)
 
-    spec = MODEL_ALIAS_LOOKUP.get(model_name.lower())
-    if spec is None:
-        return model_name, infer_root_ai_type(model_name)
-    return spec["request_id"], spec["root_ai_type"]
+    normalized = model_name.strip().lower()
+    with _REMOTE_MODEL_LOCK:
+        remote_match = REMOTE_MODEL_LOOKUP.get(normalized)
+    if remote_match is not None:
+        return remote_match
+
+    spec = MODEL_ALIAS_LOOKUP.get(normalized)
+    if spec is not None:
+        return spec["request_id"], spec["root_ai_type"]
+    return model_name, infer_root_ai_type(model_name)
 
 
 def infer_root_ai_type(model_name):
@@ -166,15 +199,11 @@ def infer_root_ai_type(model_name):
     if not isinstance(model_name, str):
         return "xinference"
 
-    normalized = model_name.lower()
+    normalized = model_name.strip().lower()
     # OpenAI / Azure 系列模型目前统一走 azure 路由。
-    azure_markers = (
-        "gpt-",
-        "gpt",
-        "o3",
-        "o4-mini",
-    )
-    return "azure" if normalized.startswith(azure_markers) else "xinference"
+    if normalized.startswith("gpt") or re.match(r"^o[1-9]\d*(?:-|$)", normalized):
+        return "azure"
+    return "xinference"
 
 
 def is_gpt_model(model_name):
